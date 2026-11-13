@@ -17,11 +17,9 @@ name: ok-to-test gated run (prototype)
 # the GitHub App's custom deployment protection rule, which ok-to-test.yml
 # answers on a maintainer's behalf.
 
-# ok-to-test.yml finds the runs to release by this exact title. A
-# pull_request_target run's own head_sha is the BASE branch commit and its
-# pull_requests list is empty for forks, so the title is the only place the
-# run records which PR commit it was triggered for. The title is built only
-# from event fields the PR author cannot choose (number and head SHA).
+# ok-to-test.yml finds the runs to release by this exact title, together with
+# the run's head commit, repository and branch. The title is built only from
+# event fields the PR author cannot choose (number and head SHA).
 run-name: "${{ format('PR #{0} @ {1}', github.event.pull_request.number, github.event.pull_request.head.sha) }}"
 
 on:
