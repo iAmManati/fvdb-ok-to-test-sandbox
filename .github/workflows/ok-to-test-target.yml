@@ -22,7 +22,7 @@ name: ok-to-test gated run (prototype)
 # pull_requests list is empty for forks, so the title is the only place the
 # run records which PR commit it was triggered for. The title is built only
 # from event fields the PR author cannot choose (number and head SHA).
-run-name: "${{ format('ok-to-test PR #{0} @ {1}', github.event.pull_request.number, github.event.pull_request.head.sha) }}"
+run-name: "${{ format('PR #{0} @ {1}', github.event.pull_request.number, github.event.pull_request.head.sha) }}"
 
 on:
   pull_request_target: # zizmor: ignore[dangerous-triggers] -- PR code runs only after the gate, at the approved commit
