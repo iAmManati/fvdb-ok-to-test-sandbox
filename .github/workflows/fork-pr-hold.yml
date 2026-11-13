@@ -1,0 +1,17 @@
+name: fork PR hold (observation)
+
+# A plain pull_request workflow, with no secrets and a read-only token. For a
+# PR from an account with no access, GitHub holds this run under the
+# repository's fork-PR approval setting. It is here to observe that hold
+# separately from the ok-to-test gate.
+
+on:
+  pull_request:
+
+permissions: {}
+
+jobs:
+  hello:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "fork PR run started"

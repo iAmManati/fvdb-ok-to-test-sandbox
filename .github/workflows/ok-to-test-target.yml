@@ -1,0 +1,196 @@
+name: ok-to-test gated run (prototype)
+
+# The gated side of the /ok-to-test prototype. See ok-to-test.yml for the
+# comment side and README.md for setup.
+#
+#   classify -> gate -> privileged
+#
+# classify  checks that ci-external-ok-to-test is protected by the App, and
+#           decides whether the run is trusted: the PR author and the account
+#           that triggered the run are both collaborators on this repository
+#           at any permission level, and the head is this repository or the
+#           author's own fork.
+# gate      is an empty job whose environment is ci-trusted (no protection) for
+#           trusted runs, or ci-external-ok-to-test for everything else.
+#
+# ci-external-ok-to-test has no required reviewers. Its only protection rule is
+# the GitHub App's custom deployment protection rule, which ok-to-test.yml
+# answers on a maintainer's behalf.
+
+# ok-to-test.yml finds the runs to release by this exact title. A
+# pull_request_target run's own head_sha is the BASE branch commit and its
+# pull_requests list is empty for forks, so the title is the only place the
+# run records which PR commit it was triggered for. The title is built only
+# from event fields the PR author cannot choose (number and head SHA).
+run-name: "${{ format('ok-to-test PR #{0} @ {1}', github.event.pull_request.number, github.event.pull_request.head.sha) }}"
+
+on:
+  pull_request_target: # zizmor: ignore[dangerous-triggers] -- PR code runs only after the gate, at the approved commit
+    branches:
+      - main
+
+permissions: {}
+
+jobs:
+  classify:
+    name: Classify PR author
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read # Read the environment's protection rules
+    outputs:
+      trusted: ${{ steps.classify.outputs.trusted }}
+    steps:
+      # GitHub silently creates an unprotected environment for any name it has
+      # not seen, and an environment whose App rule was removed or disabled
+      # protects nothing. Refuse to continue in either case.
+      - name: Verify ci-external-ok-to-test is protected by the App
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          APP_SLUG: ${{ vars.OK_TO_TEST_APP_SLUG }}
+        run: |
+          set -uo pipefail
+          if [ -z "$APP_SLUG" ]; then
+            echo "::error::Repository variable OK_TO_TEST_APP_SLUG is not set; refusing to run."
+            exit 1
+          fi
+          n=$(gh api "repos/${REPO}/environments/ci-external-ok-to-test/deployment_protection_rules" \
+                --jq "[.custom_deployment_protection_rules[] | select(.enabled and .app.slug == \"${APP_SLUG}\")] | length") || n=0
+          case "$n" in
+            ''|*[!0-9]*) n=0 ;;
+          esac
+          if [ "$n" -lt 1 ]; then
+            echo "::error::Environment ci-external-ok-to-test has no enabled protection rule from ${APP_SLUG}; refusing to run."
+            exit 1
+          fi
+          echo "ci-external-ok-to-test is protected by ${APP_SLUG}."
+
+      - name: Check that the PR author and event sender are collaborators
+        id: classify
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          REPO: ${{ github.repository }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          SENDER: ${{ github.event.sender.login }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          HEAD_OWNER: ${{ github.event.pull_request.head.repo.owner.login }}
+        run: |
+          set -uo pipefail
+          trusted=false
+
+          # True when the user is a collaborator on this repository at any
+          # permission level. With the workflow's GITHUB_TOKEN no single API
+          # call answers that, so two are combined:
+          # - the permission endpoint, for write or higher. This covers org
+          #   owners and members with access through a team: every openvdb
+          #   org member today. It cannot be used for read access, because on
+          #   a public repository it reports "read" for any GitHub user.
+          # - the check-collaborator endpoint (204 or 404), for direct and
+          #   outside collaborators at any level, read included. With this
+          #   token it answers 404 for org owners and team members.
+          # An org member whose only access is read through a team counts as
+          # neither; none exists today.
+          is_collaborator() {
+            local user="$1" perm err
+            if [ -z "$user" ]; then
+              echo "empty login" >&2
+              return 1
+            fi
+            if perm=$(gh api "repos/${REPO}/collaborators/${user}/permission" --jq '.permission'); then
+              case "$perm" in
+                admin|write)
+                  echo "${user}: ${perm} access" >&2
+                  return 0 ;;
+              esac
+            else
+              perm="lookup failed"
+            fi
+            if err=$(gh api "repos/${REPO}/collaborators/${user}" --silent 2>&1); then
+              echo "${user}: direct or outside collaborator (${perm})" >&2
+              return 0
+            fi
+            echo "${user}: not a collaborator (${perm}; ${err})" >&2
+            return 1
+          }
+
+          # True when the PR head is in this repository or in a fork owned by
+          # the PR author. A deleted head repository yields empty values and
+          # is not trusted.
+          head_is_authors() {
+            if [ -n "$HEAD_REPO" ] && [ "$HEAD_REPO" = "$REPO" ]; then
+              return 0
+            fi
+            if [ -n "$HEAD_OWNER" ] && [ "$HEAD_OWNER" = "$PR_AUTHOR" ]; then
+              return 0
+            fi
+            echo "head repository ${HEAD_REPO:-<none>} is neither ${REPO} nor owned by ${PR_AUTHOR}" >&2
+            return 1
+          }
+
+          case "$EVENT_NAME" in
+            push|workflow_dispatch|schedule)
+              echo "Event ${EVENT_NAME}: no PR code involved."
+              trusted=true ;;
+            pull_request_target)
+              if is_collaborator "$PR_AUTHOR" && is_collaborator "$SENDER" && head_is_authors; then
+                trusted=true
+              fi ;;
+            *)
+              echo "Unexpected event ${EVENT_NAME}: treating as untrusted" >&2 ;;
+          esac
+
+          echo "trusted=${trusted}"
+          echo "trusted=${trusted}" >> "$GITHUB_OUTPUT"
+          {
+            echo "### Approval gate"
+            echo "- Event: \`${EVENT_NAME}\`"
+            echo "- PR author: \`${PR_AUTHOR:-n/a}\`, triggered by: \`${SENDER:-n/a}\`, head repository: \`${HEAD_REPO:-n/a}\`"
+            echo "- Trusted: **${trusted}**"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  gate:
+    name: Approval gate
+    needs: classify
+    runs-on: ubuntu-latest
+    permissions: {}
+    # Anything other than the literal string 'true' selects the protected
+    # environment.
+    environment: ${{ needs.classify.outputs.trusted == 'true' && 'ci-trusted' || 'ci-external-ok-to-test' }}
+    steps:
+      - name: Approved
+        env:
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: echo "Gate passed for ${PR_HEAD_SHA}."
+
+  privileged:
+    name: Privileged job (stand-in)
+    needs: gate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout base (trusted)
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+
+      - name: Fetch PR head and verify it is the approved commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          # This repo is private, so the fetch needs a token.
+          auth=$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 | tr -d '\n')
+          git -c "http.https://github.com/.extraheader=AUTHORIZATION: basic ${auth}" \
+            fetch --no-tags origin "pull/${PR_NUMBER}/head:pr_branch"
+          fetched=$(git rev-parse pr_branch)
+          echo "approved: ${PR_HEAD_SHA}"
+          echo "fetched:  ${fetched}"
+          if [ "$fetched" != "$PR_HEAD_SHA" ]; then
+            echo "::error::PR head moved since this run was triggered (${PR_HEAD_SHA} -> ${fetched}). Re-run on the new commit."
+            exit 1
+          fi
+          git log -1 --format='PR head: %H %an %s' pr_branch

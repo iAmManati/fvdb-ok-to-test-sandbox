@@ -1,0 +1,166 @@
+name: ok-to-test
+
+# A maintainer comments `/ok-to-test <full commit SHA>` on a pull request, and
+# this workflow releases the held runs of the gated workflows for that PR at
+# that commit. See README.md for setup and ok-to-test-target.yml for the gated
+# side.
+#
+# Security rules (this workflow is the security boundary for the gate):
+# - issue_comment always runs this file from the default branch, never PR code.
+#   Nothing here checks out or runs code.
+# - Only newly created comments count; edits are ignored.
+# - The commenter must have write access or higher, checked through the
+#   collaborators API (author_association misreports private org members).
+# - The comment must name the PR's current head as a FULL 40-character SHA. A
+#   short SHA would let the PR author push a new commit with a matching prefix
+#   just before the maintainer comments.
+# - The comment body is untrusted: it is passed through an environment variable
+#   and matched against a strict pattern, never interpolated into a script.
+# - The App's private key lives in the ok-to-test-bot environment, which only
+#   accepts the default branch.
+
+on:
+  issue_comment: # zizmor: ignore[dangerous-triggers] -- runs no PR code; see the security rules above
+    types: [created]
+
+permissions: {}
+
+concurrency:
+  group: ok-to-test-${{ github.event.issue.number }}
+  cancel-in-progress: false
+
+env:
+  # Workflow files whose held runs this command may release, and the
+  # environment they wait on.
+  GATED_WORKFLOWS: ok-to-test-target.yml
+  GATE_ENVIRONMENT: ci-external-ok-to-test
+
+jobs:
+  approve:
+    name: Release held CI runs
+    if: github.event.issue.pull_request && startsWith(github.event.comment.body, '/ok-to-test')
+    runs-on: ubuntu-latest
+    environment: ok-to-test-bot
+    permissions:
+      actions: read # List the gated workflows' runs
+      pull-requests: write # Reply on the pull request
+    steps:
+      - name: Check the commenter and the commit
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.issue.number }}
+          COMMENTER: ${{ github.event.comment.user.login }}
+          BODY: ${{ github.event.comment.body }}
+        run: |
+          set -uo pipefail
+          reply() { printf '%s\n' "$1" > reply.md; echo "ok=false" >> "$GITHUB_OUTPUT"; }
+
+          perm=$(gh api "repos/${REPO}/collaborators/${COMMENTER}/permission" --jq '.permission') || perm=none
+          echo "${COMMENTER}: ${perm}"
+          case "$perm" in
+            admin|write) ;;
+            *) reply "@${COMMENTER} \`/ok-to-test\` needs write access to this repository. Nothing was approved."
+               exit 0 ;;
+          esac
+
+          pr=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}") || { reply "Could not read PR #${PR_NUMBER}. Nothing was approved."; exit 0; }
+          head=$(jq -r '.head.sha' <<<"$pr")
+          state=$(jq -r '.state' <<<"$pr")
+          if [ "$state" != "open" ]; then
+            reply "PR #${PR_NUMBER} is ${state}. Nothing was approved."
+            exit 0
+          fi
+
+          first=$(printf '%s\n' "$BODY" | head -n1 | tr -d '\r')
+          re='^/ok-to-test[[:space:]]+([0-9a-fA-F]{40})[[:space:]]*$'
+          if [[ ! "$first" =~ $re ]]; then
+            reply "$(printf '%s\n\n%s\n\n%s' \
+              "Usage: \`/ok-to-test <full 40-character commit SHA>\`. Nothing was approved." \
+              "The head of this PR is currently \`${head}\`." \
+              "Check that this is the commit you reviewed, then comment \`/ok-to-test ${head}\`.")"
+            exit 0
+          fi
+          sha=$(tr 'A-F' 'a-f' <<<"${BASH_REMATCH[1]}")
+          if [ "$sha" != "$head" ]; then
+            reply "$(printf '%s\n\n%s' \
+              "\`${sha}\` is not the head of this PR; the head is now \`${head}\`. Nothing was approved." \
+              "Review the new commits, then comment \`/ok-to-test ${head}\`.")"
+            exit 0
+          fi
+          echo "sha=${sha}" >> "$GITHUB_OUTPUT"
+          echo "ok=true" >> "$GITHUB_OUTPUT"
+
+      - name: Find the held runs for this commit
+        id: runs
+        if: steps.check.outputs.ok == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.issue.number }}
+          SHA: ${{ steps.check.outputs.sha }}
+        run: |
+          set -euo pipefail
+          title="ok-to-test PR #${PR_NUMBER} @ ${SHA}"
+          : > runs.txt
+          for wf in $GATED_WORKFLOWS; do
+            gh api --paginate \
+              "repos/${REPO}/actions/workflows/${wf}/runs?event=pull_request_target&status=waiting&per_page=100" \
+              --jq ".workflow_runs[] | select(.display_title == \"${title}\") | .id" >> runs.txt
+          done
+          echo "Held runs:"; cat runs.txt
+          echo "count=$(wc -l < runs.txt)" >> "$GITHUB_OUTPUT"
+
+      - name: Mint a token for the approval App
+        id: app-token
+        if: steps.check.outputs.ok == 'true' && steps.runs.outputs.count != '0'
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ vars.OK_TO_TEST_APP_CLIENT_ID }}
+          private-key: ${{ secrets.OK_TO_TEST_APP_KEY }}
+          permission-deployments: write
+          permission-actions: read
+
+      - name: Approve the held runs
+        if: steps.check.outputs.ok == 'true'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          REPO: ${{ github.repository }}
+          SERVER: ${{ github.server_url }}
+          COMMENTER: ${{ github.event.comment.user.login }}
+          COMMENT_URL: ${{ github.event.comment.html_url }}
+          SHA: ${{ steps.check.outputs.sha }}
+        run: |
+          set -uo pipefail
+          approved=() failed=()
+          while read -r id; do
+            [ -n "$id" ] || continue
+            if gh api -X POST "repos/${REPO}/actions/runs/${id}/deployment_protection_rule" \
+                 -f environment_name="$GATE_ENVIRONMENT" -f state=approved \
+                 -f comment="Approved by @${COMMENTER} for ${SHA} (${COMMENT_URL})"; then
+              approved+=("$id")
+            else
+              failed+=("$id")
+            fi
+          done < runs.txt
+          {
+            if [ ${#approved[@]} -eq 0 ] && [ ${#failed[@]} -eq 0 ]; then
+              echo "No held runs found for \`${SHA}\`. Nothing was approved."
+            else
+              [ ${#approved[@]} -gt 0 ] && echo "Approved by @${COMMENTER} for \`${SHA}\`:"
+              for id in "${approved[@]}"; do echo "- ${SERVER}/${REPO}/actions/runs/${id}"; done
+              [ ${#failed[@]} -gt 0 ] && echo "Could not approve:"
+              for id in "${failed[@]}"; do echo "- ${SERVER}/${REPO}/actions/runs/${id}"; done
+            fi
+          } > reply.md
+          cat reply.md
+          [ ${#failed[@]} -eq 0 ]
+
+      - name: Reply on the pull request
+        if: always() && hashFiles('reply.md') != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.issue.number }}
+        run: gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" -F body=@reply.md --silent
