@@ -10,7 +10,8 @@ holds no code.
 - `ok-to-test.yml` handles a comment `/ok-to-test <full commit SHA>` from an
   account with write access. It checks that the SHA is the PR's current head,
   then uses the `fvdb-ok-to-test` GitHub App to release the held runs for that
-  commit.
+  commit: the gated runs above, and fork `pull_request` runs waiting for
+  "Approve and run".
 - `fork-pr-hold.yml` is a plain `pull_request` workflow, to observe GitHub's own
   fork-PR approval hold.
 

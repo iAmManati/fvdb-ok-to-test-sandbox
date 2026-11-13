@@ -1,9 +1,12 @@
 name: ok-to-test
 
 # A maintainer comments `/ok-to-test <full commit SHA>` on a pull request, and
-# this workflow releases the held runs of the gated workflows for that PR at
-# that commit. See README.md for setup and ok-to-test-target.yml for the gated
-# side.
+# this workflow releases, for that PR at that commit:
+# - the held runs of the gated pull_request_target workflows, by approving the
+#   GitHub App's deployment protection rule; and
+# - pull_request runs from a fork that GitHub holds under the repository's
+#   fork-PR approval setting ("Approve and run").
+# See README.md for setup and ok-to-test-target.yml for the gated side.
 #
 # Security rules (this workflow is the security boundary for the gate):
 # - issue_comment always runs this file from the default branch, never PR code.
@@ -109,8 +112,14 @@ jobs:
               "repos/${REPO}/actions/workflows/${wf}/runs?event=pull_request_target&status=waiting&per_page=100" \
               --jq ".workflow_runs[] | select(.display_title == \"${title}\") | .id" >> runs.txt
           done
-          echo "Held runs:"; cat runs.txt
-          echo "count=$(wc -l < runs.txt)" >> "$GITHUB_OUTPUT"
+          # A pull_request run's head_sha is the PR head commit, so these are
+          # matched by SHA, which check confirmed is this PR's current head.
+          gh api --paginate \
+            "repos/${REPO}/actions/runs?event=pull_request&status=action_required&head_sha=${SHA}&per_page=100" \
+            --jq '.workflow_runs[].id' > fork_runs.txt
+          echo "Held gated runs:"; cat runs.txt
+          echo "Fork runs awaiting approval:"; cat fork_runs.txt
+          echo "count=$(( $(wc -l < runs.txt) + $(wc -l < fork_runs.txt) ))" >> "$GITHUB_OUTPUT"
 
       - name: Mint a token for the approval App
         id: app-token
@@ -119,8 +128,8 @@ jobs:
         with:
           client-id: ${{ vars.OK_TO_TEST_APP_CLIENT_ID }}
           private-key: ${{ secrets.OK_TO_TEST_APP_KEY }}
-          permission-deployments: write
-          permission-actions: read
+          permission-deployments: write # Approve the deployment protection rule
+          permission-actions: write # Approve fork pull_request runs
 
       - name: Approve the held runs
         if: steps.check.outputs.ok == 'true'
@@ -144,6 +153,14 @@ jobs:
               failed+=("$id")
             fi
           done < runs.txt
+          while read -r id; do
+            [ -n "$id" ] || continue
+            if gh api -X POST "repos/${REPO}/actions/runs/${id}/approve" --silent; then
+              approved+=("$id")
+            else
+              failed+=("$id")
+            fi
+          done < fork_runs.txt
           {
             if [ ${#approved[@]} -eq 0 ] && [ ${#failed[@]} -eq 0 ]; then
               echo "No held runs found for \`${SHA}\`. Nothing was approved."
