@@ -4,6 +4,7 @@ name: ok-to-test gated run (prototype)
 # comment side and README.md for setup.
 #
 #   classify -> gate -> privileged
+#           -> notify (untrusted runs: post the /ok-to-test instructions)
 #
 # classify  checks that ci-external-ok-to-test is protected by the App, and
 #           decides whether the run is trusted: the PR author and the account
@@ -146,6 +147,53 @@ jobs:
             echo "- PR author: \`${PR_AUTHOR:-n/a}\`, triggered by: \`${SENDER:-n/a}\`, head repository: \`${HEAD_REPO:-n/a}\`"
             echo "- Trusted: **${trusted}**"
           } >> "$GITHUB_STEP_SUMMARY"
+
+  # Tells maintainers how to release a held run. One comment per PR, edited
+  # on later pushes to show the new head commit. Runs no PR code: the comment
+  # is built only from the PR number and head SHA in the event payload.
+  # A failure here never affects the gate.
+  notify:
+    name: Post approval instructions
+    needs: classify
+    if: github.event_name == 'pull_request_target' && needs.classify.outputs.trusted != 'true'
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    permissions:
+      pull-requests: write # Post or update the instructions comment
+    steps:
+      - name: Post or update the /ok-to-test instructions
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          marker='<!-- ok-to-test-notice -->'
+          fence='```'
+          printf '%s\n' \
+            "$marker" \
+            "**CI is waiting for maintainer approval.**" \
+            "" \
+            "Maintainers: after reviewing the changes up to \`${HEAD_SHA}\`, comment" \
+            "" \
+            "$fence" \
+            "/ok-to-test ${HEAD_SHA}" \
+            "$fence" \
+            "" \
+            "Each new push needs a new \`/ok-to-test\`. This comment is updated to the latest commit." \
+            > notice.md
+
+          existing=$(gh api --paginate "repos/${REPO}/issues/${PR_NUMBER}/comments?per_page=100" \
+                       --jq ".[] | select(.user.login == \"github-actions[bot]\" and (.body | startswith(\"${marker}\"))) | .id" \
+                     | head -n1)
+          if [ -n "$existing" ]; then
+            gh api -X PATCH "repos/${REPO}/issues/comments/${existing}" -F body=@notice.md --silent
+            echo "Updated comment ${existing} for ${HEAD_SHA}."
+          else
+            gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" -F body=@notice.md --silent
+            echo "Posted instructions for ${HEAD_SHA}."
+          fi
 
   gate:
     name: Approval gate
